@@ -54,6 +54,10 @@
 #include <dmalloc.h>
 #endif
 
+#include <pulse/simple.h>
+#include <pulse/error.h>
+#include <pulse/gccmacro.h>
+
 /* own headers */
 #include "g711.h"
 #include "globals.h"
@@ -483,6 +487,62 @@ static int prepare_buffers(dsp_t* dsp) {
 }
 
 /*
+ * Opens pulseaudio connection
+ *
+ * returns 0 on success, -1 otherwise
+ */
+static int pulse_open(dsp_t *dsp)
+{
+  static int debug_todo = 1;
+  /* The Sample format to use */
+  static const pa_sample_spec pulse_format = {
+      .format = PA_SAMPLE_S16LE, /* DEFAULT_FORMAT */
+      .rate = DEFAULT_RATE,
+      .channels = DEFAULT_CHANNELS
+  };
+  int error;
+  unsigned int format_index;
+
+  dsp->pas = NULL;
+  /* Create a new playback stream */
+  if (!(dsp->pas = pa_simple_new(NULL, "GTick metronome", PA_STREAM_PLAYBACK, NULL, "gtick", &pulse_format, NULL, NULL, &error))) {
+    fprintf(stderr, __FILE__": pa_simple_new() failed: %s\n", pa_strerror(error));
+    return -1;
+  }
+
+  dsp->format = DEFAULT_FORMAT;
+  for (format_index = 0;
+       formats[format_index].format != 0 &&
+       formats[format_index].format != dsp->format;
+       format_index++);
+
+  if (debug && debug_todo) {
+    g_print("pulse_open: Used sample format: %s (%s)\n",
+    formats[format_index].name, formats[format_index].description);
+  }
+
+  dsp->rate = DEFAULT_RATE; /* requested default */
+  if (debug && debug_todo) {
+    g_print("pulse_open: Sampling rate = %d\n", dsp->rate);
+  }
+ 
+  dsp->channels = DEFAULT_CHANNELS;
+  if (debug && debug_todo) {
+    g_print("pulse_open: Number of channels = %d\n", dsp->channels);
+  }
+  
+  dsp->samplesize = formats[format_index].samplesize;
+  dsp->fragmentsize = dsp->rate / 10 /*0.1s fragment time*/ * dsp->channels * dsp->samplesize / 8;
+
+  if (debug && debug_todo)
+    g_print ("pulse_open: fragment size = %d\n", dsp->fragmentsize);
+
+  dsp->fragment = g_malloc(dsp->fragmentsize);
+
+  return 0;
+}
+
+/*
  * Opens sound device specified in dsp
  *
  * returns 0 on success, -1 otherwise
@@ -501,8 +561,7 @@ int dsp_open(dsp_t* dsp) {
   /* Initialise sound device */
   if ((dsp->dspfd = open(dsp->devicename, O_WRONLY)) == -1)
     {
-      perror(dsp->devicename);
-      return -1;
+      return pulse_open(dsp);
     }
 
   if (ioctl(dsp->dspfd, SNDCTL_DSP_SETFRAGMENT, &dsp->fragmentsize) == -1) {
@@ -610,6 +669,9 @@ void dsp_close(dsp_t* dsp) {
     }
   }
 
+  if (dsp->pas)
+    pa_simple_free(dsp->pas);
+
   debug_todo = 0;
 }
 
@@ -698,6 +760,67 @@ static void wrap_position(dsp_t* dsp, int ticklen) {
     comm_server_send_response(dsp->inter_thread_comm,
 			      MESSAGE_TYPE_RESPONSE_SYNC, reply);
   }
+}
+
+/*
+ * Feed pulseaudio stream with next samples
+ */
+gboolean pulse_feed(dsp_t* dsp)
+{
+  int ticklen = rint(dsp->rate / dsp->frequency) *
+                dsp->channels * dsp->samplesize / 8;
+  unsigned char *the_data; /* pointer to actual buffer */
+  int data_size;           /* size of actual buffer */
+
+  int fragments; /* number of fragments yet to write */
+  int error;
+  fragments = 1;
+
+  wrap_position(dsp, ticklen);
+
+  /* write as many fragments as possible */
+  while (fragments > 0) {
+    int i;
+    
+    /* generate fragment */
+    for (i = 0; i < dsp->fragmentsize; i++) {
+      int index;
+	
+      if (dsp->meter == 1) {                 /* single ticks */
+	the_data = dsp->tickdata0;
+	data_size = dsp->td0_size;
+      } else if (dsp->accents[dsp->cyclepos]) {  /* accentuate 1st tick */
+	the_data = dsp->tickdata1;
+	data_size = dsp->td1_size;
+      } else {                                 /* sound of 2nd tick */
+	the_data = dsp->tickdata2;
+	data_size = dsp->td2_size;
+      }
+
+      if ((index = dsp->tickpos) < data_size) { /* tick! */
+	dsp->fragment[i] = the_data[index];
+      } else { /* silence (between ticks)  */
+	dsp->fragment[i] =
+	  dsp->silence[i % (dsp->samplesize / 8 * dsp->channels)];
+      }
+
+      dsp->tickpos++;
+      wrap_position(dsp, ticklen);
+    }
+
+    if (pa_simple_write(dsp->pas, dsp->fragment, (size_t) dsp->fragmentsize, &error) < 0) {
+      g_print("pulse_feed: pa_simple_write ERROR: %s\n", pa_strerror(error));
+    }
+    fragments--;
+  }
+
+#if 0
+  if (pa_simple_drain(dsp->pas, &error) < 0) {
+    g_print("pulse_feed: pa_simple_drain ERROR: %s\n", pa_strerror(error));
+  }
+#endif
+
+  return 1;
 }
 
 /*
@@ -884,8 +1007,13 @@ void dsp_main_loop(dsp_t* dsp) {
     }
 
     if (dsp->running) { /* metronome running */
-      dsp_feed(dsp);
+      if (dsp->dspfd != -1) { /* metronome running */
+        dsp_feed(dsp);
+      } else {
+        pulse_feed(dsp);
+      }
     }
+
     nanosleep(&requested, &remaining);
   }
 }

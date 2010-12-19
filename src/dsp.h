@@ -28,12 +28,16 @@
 /* GTK headers */
 #include <gtk/gtk.h>
 
+#include <pulse/simple.h>
+
 /* own headers */
 #include "threadtalk.h"
 
 typedef struct dsp_t {
   char* devicename;
   char* soundname;
+
+  pa_simple *pas;   /* pa simple playback stream */
 
   int dspfd;        /* file descriptor */
   int fragmentsize; /* fragment size */
